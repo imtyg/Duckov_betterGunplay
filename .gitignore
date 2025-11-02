@@ -1,0 +1,38 @@
+# 排除编译中间文件和输出文件
+**/obj/
+**/bin/
+*.dll
+*.pdb
+*.exe
+
+# 排除编译缓存文件
+**/.vs/
+.vscode/
+*.user
+*.suo
+*.userprefs
+*.cache
+
+# 排除NuGet包
+packages/
+*.nupkg
+.nuget/
+
+# 排除项目临时文件
+*.csproj.user
+*.sln.docstates
+
+# 排除临时文件
+*.tmp
+*.log
+
+# 排除系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 排除临时文档和脚本
+GIT_SETUP.md
+setup-git.ps1
+
+# 注意：源码文件(.cs, .csproj)和配置文件(info.ini)将被包含在仓库中

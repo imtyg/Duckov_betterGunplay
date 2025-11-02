@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <ImplicitUsings>false</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>..\</OutputPath>
+    <AssemblyName>BetterFire</AssemblyName>
+    <RootNamespace>BetterFire</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\Assembly-CSharp.dll</HintPath>
+    </Reference>
+    <Reference Include="TeamSoda.Duckov.Core">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\TeamSoda.Duckov.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="TeamSoda.Duckov.Utilities">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\TeamSoda.Duckov.Utilities.dll</HintPath>
+    </Reference>
+    <Reference Include="ItemStatsSystem">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\ItemStatsSystem.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.CoreModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.UI.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
