@@ -35,6 +35,21 @@
     <Reference Include="UnityEngine.UI">
       <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.UI.dll</HintPath>
     </Reference>
+    <Reference Include="Unity.InputSystem">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\Unity.InputSystem.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\Unity.TextMeshPro.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.JSONSerializeModule">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.JSONSerializeModule.dll</HintPath>
+    </Reference>
+    <Reference Include="UnityEngine.TextRenderingModule">
+      <HintPath>$(MSBuildThisFileDirectory)..\..\..\Managed\UnityEngine.TextRenderingModule.dll</HintPath>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(MSBuildThisFileDirectory)0Harmony.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
 </Project>

@@ -4,9 +4,14 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using BetterFire.Settings;
+using HarmonyLib;
 using ItemStatsSystem;
 using UnityEngine;
 using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Controls;
+using UnityEngine.SceneManagement;
 
 namespace BetterFire;
 
@@ -40,8 +45,9 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     private CancelButton? _activeCancelButton;
     private PendingReloadState? _pendingReload;
     private bool _resumeReloadEnabled = true;
-
-    private static readonly string ConfigFilePath = Path.Combine(Application.streamingAssetsPath, "BetterFire.cfg");
+    private Harmony? _harmony;
+    private GameplayActivationMonitor? _activationMonitor;
+    private bool _gameplayLoopActive;
 
     private enum CancelButton
     {
@@ -53,17 +59,17 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         if (_pendingReload != null)
         {
-            Debug.Log("[BetterFire][DashDebug] Dash entered while reload resume data pending.");
+            LogDebug("[BetterFire][DashDebug] Dash entered while reload resume data pending.");
         }
         
         _isDashing = true;
-        Debug.Log("[BetterFire][DashBuffer] Dash started, input buffering active.");
+        LogDebug("[BetterFire][DashBuffer] Dash started, input buffering active.");
     }
 
     private void OnDashExit(CA_Dash dash, CharacterMainControl character)
     {
         _isDashing = false;
-        Debug.Log("[BetterFire][DashBuffer] Dash ended.");
+        LogDebug("[BetterFire][DashBuffer] Dash ended.");
         
         TryResumePendingReload(character);
         TriggerBufferedInputs();
@@ -128,7 +134,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (!gun.IsReloading() && recordedTimer >= reloadTime - 0.01f)
         {
-            Debug.Log("[BetterFire][DashDebug] Reload completed; clearing pending resume state and auto reload flag.");
+            LogDebug("[BetterFire][DashDebug] Reload completed; clearing pending resume state and auto reload flag.");
             _pendingReload = null;
             _autoReloadActive = false;
             if (_autoReloadCoroutine != null)
@@ -141,7 +147,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (nextAction is not CA_Dash)
         {
-            Debug.Log("[BetterFire][DashDebug] Reload interrupted by non-Dash action, clearing auto reload flag.");
+            LogDebug("[BetterFire][DashDebug] Reload interrupted by non-Dash action, clearing auto reload flag.");
             _pendingReload = null;
             _autoReloadActive = false;
             if (_autoReloadCoroutine != null)
@@ -160,7 +166,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             LoadBulletsStarted = loadStarted
         };
 
-        Debug.Log($"[BetterFire][DashDebug] Reload interrupted by dash at {recordedTimer:F3}s (total {reloadTime:F3}s), loadStarted={loadStarted}.");
+        LogDebug($"[BetterFire][DashDebug] Reload interrupted by dash at {recordedTimer:F3}s (total {reloadTime:F3}s), loadStarted={loadStarted}.");
     }
 
     private void TryResumePendingReload(CharacterMainControl character)
@@ -193,13 +199,13 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         var success = character.TryToReload(null);
         if (!success)
         {
-            Debug.Log("[BetterFire][DashDebug] TryToReload failed when attempting to resume; clearing pending state.");
+            LogDebug("[BetterFire][DashDebug] TryToReload failed when attempting to resume; clearing pending state.");
             _pendingReload = null;
             return;
         }
 
         _pendingReload.ResumeRequested = true;
-        Debug.Log("[BetterFire][DashDebug] Issued TryToReload to resume pending reload.");
+        LogDebug("[BetterFire][DashDebug] Issued TryToReload to resume pending reload.");
     }
 
     private void RestorePendingReload(CA_Reload reload, ItemAgent_Gun gun)
@@ -223,18 +229,17 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         SetLoadBulletsStarted(gun, _pendingReload.LoadBulletsStarted);
 
-        Debug.Log($"[BetterFire][DashDebug] Resuming reload at {recorded:F3}s (total {gun.ReloadTime:F3}s), loadStarted={_pendingReload.LoadBulletsStarted}.");
+        LogDebug($"[BetterFire][DashDebug] Resuming reload at {recorded:F3}s (total {gun.ReloadTime:F3}s), loadStarted={_pendingReload.LoadBulletsStarted}.");
         _pendingReload = null;
     }
 
-    private readonly HashSet<KeyCode> _skipKeys = new();
-    private string _skipKeysRaw = string.Empty;
-    private bool _skipNextCancel;
-    private CancelButton? _skipActiveButton;
     private bool _interruptReload = true;
     private bool _interruptUseItem = true;
     private bool _interruptInteract = true;
     private bool _dashRequestedAfterInterrupt;
+    private bool _fireInputHeld;
+    private bool _aimInputHeld;
+    private bool _debugLogsEnabled;
     private bool _autoReloadOnEmpty = true;
     private int _lastBulletCount = -1;
     private bool _autoReloadActive;
@@ -251,8 +256,84 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     private int _lastWeaponIndex = -1;  // 记录上次使用的武器索引（0或1，-1表示近战）
     private bool _wasArmedLastFrame = false;  // 上一帧是否持有武器
 
+    private readonly Dictionary<string, InputAction?> _inputActionCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, float> _inputActionRetryTimes = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _inputActionResolutionLogged = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _inputActionResolvedOnce = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _loggedMissingInputActions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, float> _perfMarkerThrottle = new(StringComparer.Ordinal);
+    private const float InputActionRetryInterval = 1.5f;
+    private MethodInfo? _getInputActionMethod;
+    private Type? _characterInputControlType;
+    private bool _loggedInputResolverFailure;
+    private bool _characterInputControlLookupAttempted;
+    private bool _inputActionMethodLookupAttempted;
+    private float _lastMissingCharacterLogTime;
+    private float _lastMissingInputLogTime;
+    private bool _loggedWeaponIndexFailure;
+    private bool _gameplayActive;
+    private string? _lastGameplayBlocker;
+
+    private static readonly WeaponShortcutBinding[] WeaponShortcutBindings =
+    {
+        new("ItemShortcut1", KeyCode.Alpha1, KeyCode.Keypad1),
+        new("ItemShortcut2", KeyCode.Alpha2, KeyCode.Keypad2),
+        new("ItemShortcut_Melee", KeyCode.V)
+    };
+
+    private readonly Dictionary<Type, CharacterReflectionCache> _characterReflectionCache = new();
+    private readonly Dictionary<Type, PropertyInfo?> _slotItemPropertyCache = new();
+
     private static FieldInfo? GetInstanceField(Type type, string name) =>
         type.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy);
+
+    private CharacterReflectionCache GetCharacterReflection(Type type)
+    {
+        if (!_characterReflectionCache.TryGetValue(type, out var cache))
+        {
+            cache = new CharacterReflectionCache();
+            _characterReflectionCache[type] = cache;
+        }
+
+        return cache;
+    }
+
+    private PropertyInfo? GetSlotItemProperty(Type slotType)
+    {
+        if (!_slotItemPropertyCache.TryGetValue(slotType, out var property))
+        {
+            property = slotType.GetProperty("Item", BindingFlags.Public | BindingFlags.Instance);
+            _slotItemPropertyCache[slotType] = property;
+        }
+
+        return property;
+    }
+
+    private readonly struct WeaponShortcutBinding
+    {
+        public WeaponShortcutBinding(string actionName, params KeyCode[] keys)
+        {
+            ActionName = actionName;
+            Keys = keys;
+        }
+
+        public string ActionName { get; }
+        public KeyCode[] Keys { get; }
+        public KeyCode CanonicalKey => Keys.Length > 0 ? Keys[0] : KeyCode.None;
+    }
+
+    private sealed class CharacterReflectionCache
+    {
+        public MethodInfo? SwitchToWeapon;
+        public MethodInfo? PrimGunSlot;
+        public MethodInfo? SecGunSlot;
+        public MethodInfo? MeleeWeaponSlot;
+        public MethodInfo? SwitchHoldAgentInSlot;
+        public PropertyInfo? CurrentHoldItemAgentProperty;
+        public FieldInfo? CurrentHoldItemAgentField;
+        public PropertyInfo? CurrentWeaponIndexProperty;
+        public FieldInfo? CurrentWeaponIndexField;
+    }
 
     private sealed class PendingReloadState
     {
@@ -324,59 +405,74 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         }
 
         _reflectionReady = !missing;
+        _harmony = new Harmony("BetterFire.Mod");
+        _harmony.PatchAll();
+
+        BetterFireSettings.Load();
+        BetterFireSettings.OnSettingsChanged += ApplySettings;
+        ApplySettings(BetterFireSettings.Current);
+        EnsureActivationMonitor();
     }
 
     private void Start()
     {
-        LoadConfiguration();
-        Debug.Log($"[BetterFire][AutoReload] Mod initialized. Auto reload on empty: {_autoReloadOnEmpty}");
+        LogDebug($"[BetterFire][AutoReload] Mod initialized. Auto reload on empty: {_autoReloadOnEmpty}");
     }
 
     private void Update()
     {
-        var levelManager = LevelManager.Instance;
-        if (levelManager == null)
+        if (!_gameplayLoopActive)
         {
-            ResetState();
             return;
         }
 
+        var character = CharacterMainControl.Main;
+        if (character == null)
+        {
+            UpdateGameplayState(false, "CharacterMainControl.Main is null");
+            LogLifecycle(ref _lastMissingCharacterLogTime, "[BetterFire][Lifecycle] CharacterMainControl.Main is null (likely menu)");
+            ResetState();
+            return;
+        }
+        
         if (!_reflectionReady)
         {
+            UpdateGameplayState(false, "Reflection not ready");
+            LogDebug("[BetterFire][Lifecycle] Reflection state not ready, Update skipped.");
             return;
         }
 
-        var character = levelManager.MainCharacter;
-        var inputManager = levelManager.InputManager;
-
-        if (character == null || inputManager == null)
+        var inputManager = LevelManager.Instance?.InputManager;
+        if (inputManager == null)
         {
+            UpdateGameplayState(false, "InputManager unavailable");
+            LogLifecycle(ref _lastMissingInputLogTime, "[BetterFire][Lifecycle] InputManager unavailable");
             ResetState();
             return;
         }
 
-        var firePressed = Input.GetMouseButtonDown(0);
-        var fireHeld = Input.GetMouseButton(0);
-        var fireReleased = Input.GetMouseButtonUp(0);
-        var aimPressed = Input.GetMouseButtonDown(1);
-        var aimHeld = Input.GetMouseButton(1);
-        var aimReleased = Input.GetMouseButtonUp(1);
-        var spacePressed = Input.GetKeyDown(KeyCode.Space);
+        UpdateGameplayState(true, "Ready");
+        
+        var fireAction = GetInputAction("Trigger");
+        var aimAction = GetInputAction("ADS");
+        var dashAction = GetInputAction("Dash");
+
+        var firePressed = fireAction?.WasPressedThisFrame() ?? (Mouse.current?.leftButton?.wasPressedThisFrame ?? false);
+        var fireHeld = fireAction?.IsPressed() ?? (Mouse.current?.leftButton?.isPressed ?? false);
+        var fireReleased = fireAction?.WasReleasedThisFrame() ?? (Mouse.current?.leftButton?.wasReleasedThisFrame ?? false);
+
+        var aimPressed = aimAction?.WasPressedThisFrame() ?? (Mouse.current?.rightButton?.wasPressedThisFrame ?? false);
+        var aimHeld = aimAction?.IsPressed() ?? (Mouse.current?.rightButton?.isPressed ?? false);
+        var aimReleased = aimAction?.WasReleasedThisFrame() ?? (Mouse.current?.rightButton?.wasReleasedThisFrame ?? false);
+
+        _fireInputHeld = fireHeld;
+        _aimInputHeld = aimHeld;
+
+        var spacePressed = dashAction?.WasPressedThisFrame() ?? ((Keyboard.current?.spaceKey)?.wasPressedThisFrame ?? false);
 
         if (fireReleased)
         {
             _autoReloadActive = false;
-        }
-
-        if (_skipKeys.Count > 0)
-        {
-            foreach (var key in _skipKeys)
-            {
-                if (Input.GetKeyDown(key))
-                {
-                    _skipNextCancel = true;
-                }
-            }
         }
 
         if (!fireHeld && !aimHeld)
@@ -422,7 +518,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     var bulletCount = GetBulletCount(gun);
                     if (bulletCount <= 5 && bulletCount != _lastBulletCount)  // 子弹数较少时输出
                     {
-                        Debug.Log($"[BetterFire][AutoReload] Fire held, bullets: {bulletCount}, last: {_lastBulletCount}");
+                        LogDebug($"[BetterFire][AutoReload] Fire held, bullets: {bulletCount}, last: {_lastBulletCount}");
                     }
                 }
             }
@@ -445,7 +541,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             TrackAndAutoSwitchWeapon(character, firePressed);
         }
 
-        if (_cancelActive && !Input.GetMouseButton(0) && !Input.GetMouseButton(1))
+        if (_cancelActive && !fireHeld && !aimHeld)
         {
             CompleteCancel(character, inputManager, _activeCancelButton == CancelButton.Fire);
         }
@@ -461,31 +557,19 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         bool released,
         bool isFire)
     {
-        if (pressed)
+        if (pressed && !pointerOverUi)
         {
-            if (_skipNextCancel)
-            {
-                _skipActiveButton = button;
-                _skipNextCancel = false;
-            }
-            else if (!pointerOverUi)
-            {
-                OnCancelPressed(character, inputManager, button, isFire);
-            }
+            OnCancelPressed(character, inputManager, button, isFire);
         }
 
-        if (held && !pointerOverUi && _skipActiveButton != button)
+        if (held && !pointerOverUi)
         {
             OnCancelHeld(character, inputManager, isFire);
         }
 
         if (released)
         {
-            if (_skipActiveButton == button)
-            {
-                _skipActiveButton = null;
-            }
-            else if (!pointerOverUi)
+            if (!pointerOverUi)
             {
                 OnCancelReleased(character, inputManager, isFire);
             }
@@ -500,7 +584,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         _holdCancelLogged = false;
         var buttonLabel = isFire ? "Fire" : "Aim";
-        Debug.Log($"[BetterFire][DashDebug] {buttonLabel} pressed. running={character.Running}, sprintSuppressed={_sprintSuppressed}, action={DescribeAction(character.CurrentAction)}");
+        LogDebug($"[BetterFire][DashDebug] {buttonLabel} pressed. running={character.Running}, sprintSuppressed={_sprintSuppressed}, action={DescribeAction(character.CurrentAction)}");
 
         if (isFire)
         {
@@ -545,7 +629,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         if (!_holdCancelLogged)
         {
             var buttonLabel = isFire ? "Fire" : "Aim";
-            Debug.Log($"[BetterFire][DashDebug] {buttonLabel} held. running={character.Running}, sprintSuppressed={_sprintSuppressed}, action={DescribeAction(character.CurrentAction)}");
+            LogDebug($"[BetterFire][DashDebug] {buttonLabel} held. running={character.Running}, sprintSuppressed={_sprintSuppressed}, action={DescribeAction(character.CurrentAction)}");
             _holdCancelLogged = true;
         }
 
@@ -560,7 +644,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     private void OnCancelReleased(CharacterMainControl character, InputManager inputManager, bool isFire)
     {
         var buttonLabel = isFire ? "Fire" : "Aim";
-        Debug.Log($"[BetterFire][DashDebug] {buttonLabel} released. running={character.Running}, sprintSuppressed={_sprintSuppressed}, cancelActive={_cancelActive}, action={DescribeAction(character.CurrentAction)}");
+        LogDebug($"[BetterFire][DashDebug] {buttonLabel} released. running={character.Running}, sprintSuppressed={_sprintSuppressed}, cancelActive={_cancelActive}, action={DescribeAction(character.CurrentAction)}");
         CompleteCancel(character, inputManager, isFire);
     }
 
@@ -584,6 +668,13 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (!_cancelActive)
         {
+            return;
+        }
+
+        var otherButtonHeld = isFire ? _aimInputHeld : _fireInputHeld;
+        if (otherButtonHeld)
+        {
+            _activeCancelButton = isFire ? CancelButton.Aim : CancelButton.Fire;
             return;
         }
 
@@ -648,12 +739,18 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         }
     }
 
-    private static bool IsSprintHotKeyHeld()
+    private bool IsSprintHotKeyHeld()
     {
-        return Input.GetKey(KeyCode.LeftShift) ||
-               Input.GetKey(KeyCode.RightShift) ||
-               Input.GetKey(KeyCode.JoystickButton8) ||
-               Input.GetKey(KeyCode.JoystickButton9);
+        var runAction = GetInputAction("Run");
+        if (runAction != null)
+        {
+            return runAction.IsPressed();
+        }
+
+        return IsKeyHeldInputSystem(KeyCode.LeftShift) ||
+               IsKeyHeldInputSystem(KeyCode.RightShift) ||
+               IsKeyHeldInputSystem(KeyCode.JoystickButton8) ||
+               IsKeyHeldInputSystem(KeyCode.JoystickButton9);
     }
 
     private static bool ReadRunInputBuffer(InputManager inputManager)
@@ -700,7 +797,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (previous != null || current != null)
         {
-            Debug.Log($"[BetterFire][DashDebug] Action transition: {DescribeAction(previous)} -> {DescribeAction(current)}");
+            LogDebug($"[BetterFire][DashDebug] Action transition: {DescribeAction(previous)} -> {DescribeAction(current)}");
         }
 
         if (_pendingReload != null && !_pendingReload.ResumeRequested && current is not CA_Dash)
@@ -715,13 +812,13 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         var timer = GetActionTimer(action);
         var (progressCurrent, progressTotal) = GetProgressValues(action);
-        Debug.Log($"[BetterFire][DashDebug] {stage} {DescribeAction(action)} timer={FormatFloat(timer)} progress={FormatFloat(progressCurrent)}/{FormatFloat(progressTotal)}");
+        LogDebug($"[BetterFire][DashDebug] {stage} {DescribeAction(action)} timer={FormatFloat(timer)} progress={FormatFloat(progressCurrent)}/{FormatFloat(progressTotal)}");
 
         if (action is CA_Reload reload)
         {
             var gun = GetReloadGun(reload);
             var preferred = GetReloadPreferredBullet(reload);
-            Debug.Log($"[BetterFire][DashDebug] {stage} reload: gun={DescribeUnityObject(gun)}, preferred={DescribeUnityObject(preferred)}, running={reload.Running}");
+            LogDebug($"[BetterFire][DashDebug] {stage} reload: gun={DescribeUnityObject(gun)}, preferred={DescribeUnityObject(preferred)}, running={reload.Running}");
         }
     }
 
@@ -926,7 +1023,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
     private void LogSprintState(CharacterMainControl character, string stage)
     {
-        Debug.Log($"[BetterFire][DashDebug] Sprint[{stage}]: running={character.Running}, suppressed={_sprintSuppressed}, cancelActive={_cancelActive}, toggleMode={_toggleSprintMode}, sprintKeyHeld={_sprintKeyHeldOnPress}, runOnPress={_runInputOnPress}, bufferOnPress={_runInputBufferOnPress}");
+        LogDebug($"[BetterFire][DashDebug] Sprint[{stage}]: running={character.Running}, suppressed={_sprintSuppressed}, cancelActive={_cancelActive}, toggleMode={_toggleSprintMode}, sprintKeyHeld={_sprintKeyHeldOnPress}, runOnPress={_runInputOnPress}, bufferOnPress={_runInputBufferOnPress}");
     }
 
     private void ResetState()
@@ -944,9 +1041,10 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         _lastObservedAction = null;
         _holdCancelLogged = false;
         _pendingReload = null;
-        _skipNextCancel = false;
-        _skipActiveButton = null;
         _dashRequestedAfterInterrupt = false;
+                        _loggedWeaponIndexFailure = false;
+        _fireInputHeld = false;
+        _aimInputHeld = false;
         _lastBulletCount = -1;
         _autoReloadActive = false;
         
@@ -978,7 +1076,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         {
             if (_lastObservedAction != null)
             {
-                Debug.Log("[BetterFire][DashDebug] No current action (idle).");
+                LogDebug("[BetterFire][DashDebug] No current action (idle).");
             }
             _lastInteractionStopAttempt = null;
             return false;
@@ -992,7 +1090,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (!ShouldForceStop(currentAction, character, allowInterruptInteract))
         {
-            Debug.Log($"[BetterFire][DashDebug] Skip cancel for {DescribeAction(currentAction)} (ShouldForceStop=false).");
+            LogDebug($"[BetterFire][DashDebug] Skip cancel for {DescribeAction(currentAction)} (ShouldForceStop=false).");
             _lastInteractionStopAttempt = null;
             return false;
         }
@@ -1023,7 +1121,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         }
 
         var wasInteract = currentAction is CA_Interact;
-        Debug.Log($"[BetterFire][DashDebug] StopAction succeeded for {DescribeAction(currentAction)}.");
+        LogDebug($"[BetterFire][DashDebug] StopAction succeeded for {DescribeAction(currentAction)}.");
         _lastInteractionStopAttempt = null;
         _lastLoggedAction = null;
         return wasInteract && _interruptInteract;
@@ -1043,7 +1141,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                 var result = dashMethod.Invoke(character, null);
                 if (result is bool success && success)
                 {
-                    Debug.Log("[BetterFire][DashDebug] Successfully triggered dash after interrupting interaction.");
+                    LogDebug("[BetterFire][DashDebug] Successfully triggered dash after interrupting interaction.");
                     return true;
                 }
             }
@@ -1053,7 +1151,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                 if (dashMethod != null)
                 {
                     dashMethod.Invoke(character, null);
-                    Debug.Log("[BetterFire][DashDebug] Successfully triggered dash after interrupting interaction.");
+                    LogDebug("[BetterFire][DashDebug] Successfully triggered dash after interrupting interaction.");
                     return true;
                 }
             }
@@ -1070,7 +1168,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         if (!_autoReloadOnEmpty)
         {
-            Debug.Log("[BetterFire][AutoReload] Feature disabled in config.");
+            LogDebug("[BetterFire][AutoReload] Feature disabled in config.");
             return;
         }
 
@@ -1079,7 +1177,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         {
             if (_lastBulletCount != -1)
             {
-                Debug.Log("[BetterFire][AutoReload] No gun equipped.");
+                LogDebug("[BetterFire][AutoReload] No gun equipped.");
                 _lastBulletCount = -1;
             }
             return;
@@ -1088,7 +1186,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         var currentBulletCount = GetBulletCount(gun);
         if (currentBulletCount < 0)
         {
-            Debug.Log("[BetterFire][AutoReload] Failed to get bullet count.");
+            LogDebug("[BetterFire][AutoReload] Failed to get bullet count.");
             return;
         }
 
@@ -1097,7 +1195,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             _lastBulletCount = currentBulletCount;
             if (_autoReloadActive)
             {
-                Debug.Log("[BetterFire][AutoReload] Magazine refilled, clearing auto reload flag.");
+                LogDebug("[BetterFire][AutoReload] Magazine refilled, clearing auto reload flag.");
                 _autoReloadActive = false;
             }
             return;
@@ -1113,26 +1211,26 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         var currentAction = character.CurrentAction;
         if (currentAction != null && currentAction is CA_Reload)
         {
-            Debug.Log("[BetterFire][AutoReload] Already reloading, skipping auto reload.");
+            LogDebug("[BetterFire][AutoReload] Already reloading, skipping auto reload.");
             return;
         }
 
         if (!character.CanUseHand())
         {
-            Debug.Log("[BetterFire][AutoReload] Cannot use hand, skipping auto reload.");
+            LogDebug("[BetterFire][AutoReload] Cannot use hand, skipping auto reload.");
             return;
         }
 
         if (_autoReloadCoroutine == null)
         {
-            Debug.Log($"[BetterFire][AutoReload] Empty magazine detected! Starting auto reload coroutine. BulletCount: {currentBulletCount}");
+            LogDebug($"[BetterFire][AutoReload] Empty magazine detected! Starting auto reload coroutine. BulletCount: {currentBulletCount}");
             _autoReloadCoroutine = StartCoroutine(AutoReloadCoroutine(character, inputManager));
         }
     }
 
     private IEnumerator AutoReloadCoroutine(CharacterMainControl character, InputManager inputManager)
     {
-        Debug.Log("[BetterFire][AutoReload] Coroutine started - clearing fire input...");
+        LogDebug("[BetterFire][AutoReload] Coroutine started - clearing fire input...");
         
         // Step 1: 清除射击输入
         inputManager.SetTrigger(false, false, false);
@@ -1140,13 +1238,13 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         // Step 2: 等待一帧，让游戏状态更新
         yield return null;
         
-        Debug.Log("[BetterFire][AutoReload] Attempting to trigger reload...");
+        LogDebug("[BetterFire][AutoReload] Attempting to trigger reload...");
         
         // Step 3: 检查是否仍然持有武器且需要换弹
         var gun = character.GetGun();
         if (gun == null)
         {
-            Debug.Log("[BetterFire][AutoReload] No gun equipped, aborting.");
+            LogDebug("[BetterFire][AutoReload] No gun equipped, aborting.");
             _autoReloadCoroutine = null;
             yield break;
         }
@@ -1154,14 +1252,14 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         var currentAction = character.CurrentAction;
         if (currentAction != null && currentAction is CA_Reload)
         {
-            Debug.Log("[BetterFire][AutoReload] Already reloading, aborting.");
+            LogDebug("[BetterFire][AutoReload] Already reloading, aborting.");
             _autoReloadCoroutine = null;
             yield break;
         }
 
         if (!character.CanUseHand())
         {
-            Debug.Log("[BetterFire][AutoReload] Cannot use hand, aborting.");
+            LogDebug("[BetterFire][AutoReload] Cannot use hand, aborting.");
             _autoReloadCoroutine = null;
             yield break;
         }
@@ -1170,11 +1268,11 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         if (character.TryToReload(null))
         {
             _autoReloadActive = true;
-            Debug.Log("[BetterFire][AutoReload] Reload triggered successfully!");
+            LogDebug("[BetterFire][AutoReload] Reload triggered successfully!");
         }
         else
         {
-            Debug.Log("[BetterFire][AutoReload] TryToReload returned false.");
+            LogDebug("[BetterFire][AutoReload] TryToReload returned false.");
         }
         
         _autoReloadCoroutine = null;
@@ -1218,20 +1316,20 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         // 监听武器切换按键，直接更新记录的武器索引
         // 这是一个备用方案，如果反射方法失败，至少能通过玩家输入来追踪
         
-        if (Input.GetKeyDown(KeyCode.Alpha1) || Input.GetKeyDown(KeyCode.Keypad1))
+        if (WasWeaponShortcutTriggered(WeaponShortcutBindings[0], out var label1))
         {
             _lastWeaponIndex = 0;
-            Debug.Log("[BetterFire][AutoSwitch] Player pressed 1, tracking weapon index 0");
+            LogDebug($"[BetterFire][AutoSwitch] Player triggered {label1}, tracking weapon index 0");
         }
-        else if (Input.GetKeyDown(KeyCode.Alpha2) || Input.GetKeyDown(KeyCode.Keypad2))
+        else if (WasWeaponShortcutTriggered(WeaponShortcutBindings[1], out var label2))
         {
             _lastWeaponIndex = 1;
-            Debug.Log("[BetterFire][AutoSwitch] Player pressed 2, tracking weapon index 1");
+            LogDebug($"[BetterFire][AutoSwitch] Player triggered {label2}, tracking weapon index 1");
         }
-        else if (Input.GetKeyDown(KeyCode.V))
+        else if (WasWeaponShortcutTriggered(WeaponShortcutBindings[2], out var meleeLabel))
         {
             _lastWeaponIndex = -1;
-            Debug.Log("[BetterFire][AutoSwitch] Player pressed V, tracking melee weapon (index -1)");
+            LogDebug($"[BetterFire][AutoSwitch] Player triggered {meleeLabel}, tracking melee weapon (index -1)");
         }
     }
     
@@ -1239,6 +1337,8 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         try
         {
+            var characterType = character.GetType();
+            var reflection = GetCharacterReflection(characterType);
             var gun = character.GetGun();
             // 修复：检查是否真的空手，而不仅仅是没有枪械
             // 需要检查当前持有的物品代理(ItemAgent)，而不只是检查Gun
@@ -1255,7 +1355,8 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     if (_lastWeaponIndex != currentWeaponIndex)
                     {
                         _lastWeaponIndex = currentWeaponIndex;
-                        Debug.Log($"[BetterFire][AutoSwitch] Weapon tracked: index={currentWeaponIndex}");
+                        LogDebug($"[BetterFire][AutoSwitch] Weapon tracked: index={currentWeaponIndex}");
+                        _loggedWeaponIndexFailure = false;
                     }
                 }
                 _wasArmedLastFrame = true;
@@ -1263,16 +1364,16 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             // 如果当前空手且按下开火键，切换回上次的武器
             else if (!currentlyArmed && firePressed && _lastWeaponIndex >= -1)
             {
-                Debug.Log($"[BetterFire][AutoSwitch] Unarmed fire detected, switching back to weapon index {_lastWeaponIndex}");
-                
-                var characterType = character.GetType();
-                var switchToWeaponMethod = characterType.GetMethod("SwitchToWeapon", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                
+                LogDebug($"[BetterFire][AutoSwitch] Unarmed fire detected, switching back to weapon index {_lastWeaponIndex}");
+                var switchToWeaponMethod = reflection.SwitchToWeapon ??=
+                    characterType.GetMethod("SwitchToWeapon", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+
                 if (switchToWeaponMethod != null)
                 {
                     switchToWeaponMethod.Invoke(character, new object[] { _lastWeaponIndex });
-                    Debug.Log($"[BetterFire][AutoSwitch] Successfully switched to weapon index {_lastWeaponIndex}");
-                }
+                        LogDebug($"[BetterFire][AutoSwitch] Successfully switched to weapon index {_lastWeaponIndex}");
+                        _loggedWeaponIndexFailure = false;
+                    }
                 else
                 {
                     Debug.LogWarning("[BetterFire][AutoSwitch] Could not find SwitchToWeapon method.");
@@ -1296,13 +1397,16 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         try
         {
             var characterType = character.GetType();
-            var currentHoldAgentProperty = characterType.GetProperty("CurrentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var reflection = GetCharacterReflection(characterType);
+            var currentHoldAgentProperty = reflection.CurrentHoldItemAgentProperty ??=
+                characterType.GetProperty("CurrentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (currentHoldAgentProperty != null)
             {
                 return currentHoldAgentProperty.GetValue(character);
             }
             
-            var currentHoldAgentField = characterType.GetField("currentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var currentHoldAgentField = reflection.CurrentHoldItemAgentField ??=
+                characterType.GetField("currentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (currentHoldAgentField != null)
             {
                 return currentHoldAgentField.GetValue(character);
@@ -1321,26 +1425,31 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         try
         {
             var characterType = character.GetType();
+            var reflection = GetCharacterReflection(characterType);
             
             // 方法1：尝试通过 CurrentWeaponIndex 属性/字段获取
-            var currentWeaponIndexField = characterType.GetField("currentWeaponIndex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var currentWeaponIndexField = reflection.CurrentWeaponIndexField ??=
+                characterType.GetField("currentWeaponIndex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (currentWeaponIndexField != null)
             {
                 var value = currentWeaponIndexField.GetValue(character);
                 if (value is int index)
                 {
-                    Debug.Log($"[BetterFire][AutoSwitch] Found weapon index via field: {index}");
+                    LogDebug($"[BetterFire][AutoSwitch] Found weapon index via field: {index}");
+                    _loggedWeaponIndexFailure = false;
                     return index;
                 }
             }
             
-            var currentWeaponIndexProperty = characterType.GetProperty("CurrentWeaponIndex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var currentWeaponIndexProperty = reflection.CurrentWeaponIndexProperty ??=
+                characterType.GetProperty("CurrentWeaponIndex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (currentWeaponIndexProperty != null)
             {
                 var value = currentWeaponIndexProperty.GetValue(character);
                 if (value is int index)
                 {
-                    Debug.Log($"[BetterFire][AutoSwitch] Found weapon index via property: {index}");
+                    LogDebug($"[BetterFire][AutoSwitch] Found weapon index via property: {index}");
+                    _loggedWeaponIndexFailure = false;
                     return index;
                 }
             }
@@ -1350,8 +1459,10 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             if (gun != null)
             {
                 // 获取主副武器槽位的方法
-                var primGunSlotMethod = characterType.GetMethod("PrimGunSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                var secGunSlotMethod = characterType.GetMethod("SecGunSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var primGunSlotMethod = reflection.PrimGunSlot ??=
+                    characterType.GetMethod("PrimGunSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var secGunSlotMethod = reflection.SecGunSlot ??=
+                    characterType.GetMethod("SecGunSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 
                 if (primGunSlotMethod != null && secGunSlotMethod != null)
                 {
@@ -1362,7 +1473,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     {
                         // 获取槽位中的Item
                         var slotType = primSlot.GetType();
-                        var itemProperty = slotType.GetProperty("Item", BindingFlags.Public | BindingFlags.Instance);
+                        var itemProperty = GetSlotItemProperty(slotType);
                         if (itemProperty != null)
                         {
                             var primGun = itemProperty.GetValue(primSlot);
@@ -1370,12 +1481,14 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                             
                             if (ReferenceEquals(gun, primGun))
                             {
-                                Debug.Log("[BetterFire][AutoSwitch] Current weapon is primary (index 0)");
+                                LogDebug("[BetterFire][AutoSwitch] Current weapon is primary (index 0)");
+                                _loggedWeaponIndexFailure = false;
                                 return 0;  // 主武器
                             }
                             else if (ReferenceEquals(gun, secGun))
                             {
-                                Debug.Log("[BetterFire][AutoSwitch] Current weapon is secondary (index 1)");
+                                LogDebug("[BetterFire][AutoSwitch] Current weapon is secondary (index 1)");
+                                _loggedWeaponIndexFailure = false;
                                 return 1;  // 副武器
                             }
                         }
@@ -1384,7 +1497,8 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             }
             
             // 方法3：检查是否是近战武器
-            var currentHoldAgentProperty = characterType.GetProperty("CurrentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            var currentHoldAgentProperty = reflection.CurrentHoldItemAgentProperty ??=
+                characterType.GetProperty("CurrentHoldItemAgent", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (currentHoldAgentProperty != null)
             {
                 var currentAgent = currentHoldAgentProperty.GetValue(character);
@@ -1393,17 +1507,26 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     var agentTypeName = currentAgent.GetType().Name;
                     if (agentTypeName.Contains("Melee") || agentTypeName.Contains("melee"))
                     {
-                        Debug.Log("[BetterFire][AutoSwitch] Current weapon is melee (index -1)");
+                        LogDebug("[BetterFire][AutoSwitch] Current weapon is melee (index -1)");
+                        _loggedWeaponIndexFailure = false;
                         return -1;  // 近战武器
                     }
                 }
             }
             
-            Debug.LogWarning("[BetterFire][AutoSwitch] Could not determine weapon index");
+            if (!_loggedWeaponIndexFailure)
+            {
+                Debug.LogWarning("[BetterFire][AutoSwitch] Could not determine weapon index");
+                _loggedWeaponIndexFailure = true;
+            }
         }
         catch (Exception ex)
         {
-            Debug.LogWarning($"[BetterFire][AutoSwitch] Error getting weapon index: {ex.Message}");
+            if (!_loggedWeaponIndexFailure)
+            {
+                Debug.LogWarning($"[BetterFire][AutoSwitch] Error getting weapon index: {ex.Message}");
+                _loggedWeaponIndexFailure = true;
+            }
         }
         
         return -2;  // 无法确定
@@ -1415,29 +1538,30 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     
     private void CheckAndBufferWeaponSwitchKeys()
     {
-        // 监听武器切换键：1-2 (主武器) + V键（近战武器）
-        var keysToCheck = new[]
+        foreach (var binding in WeaponShortcutBindings)
         {
-            KeyCode.Alpha1, KeyCode.Alpha2,  // 主武器
-            KeyCode.Keypad1, KeyCode.Keypad2, // 小键盘主武器
-            KeyCode.V  // 近战武器
-        };
-
-        foreach (var key in keysToCheck)
-        {
-            if (Input.GetKeyDown(key))
+            if (WasWeaponShortcutTriggered(binding, out var label))
             {
-                // 只保留最后一个按下的键（避免缓冲过多）
-                if (_bufferedKeys.Count > 0)
-                {
-                    _bufferedKeys.Clear();
-                }
-                
-                _bufferedKeys.Add(key);
-                Debug.Log($"[BetterFire][DashBuffer] Key buffered during dash: {key}");
+                BufferWeaponKey(binding.CanonicalKey, label);
                 break; // 每帧只处理一个按键
             }
         }
+    }
+
+    private void BufferWeaponKey(KeyCode key, string label)
+    {
+        if (key == KeyCode.None)
+        {
+            return;
+        }
+
+        if (_bufferedKeys.Count > 0)
+        {
+            _bufferedKeys.Clear();
+        }
+
+        _bufferedKeys.Add(key);
+        LogDebug($"[BetterFire][DashBuffer] Input buffered during dash: {label} ({key})");
     }
 
     private void TriggerBufferedInputs()
@@ -1453,7 +1577,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             return;
         }
 
-        Debug.Log($"[BetterFire][DashBuffer] Triggering {_bufferedKeys.Count} buffered inputs...");
+        LogDebug($"[BetterFire][DashBuffer] Triggering {_bufferedKeys.Count} buffered inputs...");
         
         // 停止之前的协程（如果有）
         if (_inputBufferCoroutine != null)
@@ -1475,11 +1599,11 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         foreach (var key in keysToReplay)
         {
-            Debug.Log($"[BetterFire][DashBuffer] Replaying key: {key}");
+            LogDebug($"[BetterFire][DashBuffer] Replaying key: {key}");
             
             // 等待玩家松开该键（如果还在按着）
             var timeout = 0f;
-            while (Input.GetKey(key) && timeout < 0.5f)
+            while (IsKeyHeldInputSystem(key) && timeout < 0.5f)
             {
                 timeout += Time.deltaTime;
                 yield return null;
@@ -1492,7 +1616,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             // 注意：Unity的Input系统不支持直接注入按键事件
             // 我们需要在这里调用游戏的武器切换方法
             // 由于没有直接的API，我们记录日志提示玩家可以再按一次
-            Debug.Log($"[BetterFire][DashBuffer] Key {key} ready to be processed. Checking if player is still pressing...");
+            LogDebug($"[BetterFire][DashBuffer] Key {key} ready to be processed. Checking if player is still pressing...");
             
             // 如果玩家在Dash结束后立即再次按下该键，游戏会自然处理
             // 这里我们无法直接模拟按键，但可以通过其他方式实现
@@ -1510,20 +1634,22 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             var levelManager = LevelManager.Instance;
             if (levelManager == null) return;
 
-            var character = levelManager.MainCharacter;
+            var character = CharacterMainControl.Main;
             if (character == null) return;
 
             var characterType = character.GetType();
+            var reflection = GetCharacterReflection(characterType);
 
             // 特殊处理：V键 - 近战武器切换
             if (key == KeyCode.V)
             {
-                Debug.Log("[BetterFire][DashBuffer] Attempting to switch to melee weapon...");
+                LogDebug("[BetterFire][DashBuffer] Attempting to switch to melee weapon...");
                 
                 // 方法1: 尝试获取近战武器槽位并切换
                 try
                 {
-                    var meleeSlotMethod = characterType.GetMethod("MeleeWeaponSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var meleeSlotMethod = reflection.MeleeWeaponSlot ??=
+                        characterType.GetMethod("MeleeWeaponSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     if (meleeSlotMethod != null && meleeSlotMethod.GetParameters().Length == 0)
                     {
                         var meleeSlot = meleeSlotMethod.Invoke(character, null);
@@ -1547,11 +1673,12 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                             if (slotHash != 0)
                             {
                                 // 使用槽位哈希切换
-                                var switchMethod = characterType.GetMethod("SwitchHoldAgentInSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                var switchMethod = reflection.SwitchHoldAgentInSlot ??=
+                                    characterType.GetMethod("SwitchHoldAgentInSlot", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                                 if (switchMethod != null)
                                 {
                                     switchMethod.Invoke(character, new object[] { slotHash });
-                                    Debug.Log($"[BetterFire][DashBuffer] Successfully switched to melee weapon via SwitchHoldAgentInSlot({slotHash})");
+                                    LogDebug($"[BetterFire][DashBuffer] Successfully switched to melee weapon via SwitchHoldAgentInSlot({slotHash})");
                                     return;
                                 }
                             }
@@ -1566,7 +1693,8 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                 // 方法2: 尝试使用 SwitchToWeapon(-1) 或其他索引
                 try
                 {
-                    var switchToWeaponMethod = characterType.GetMethod("SwitchToWeapon", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var switchToWeaponMethod = reflection.SwitchToWeapon ??=
+                        characterType.GetMethod("SwitchToWeapon", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                     if (switchToWeaponMethod != null)
                     {
                         var parameters = switchToWeaponMethod.GetParameters();
@@ -1578,7 +1706,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                                 try
                                 {
                                     switchToWeaponMethod.Invoke(character, new object[] { index });
-                                    Debug.Log($"[BetterFire][DashBuffer] Successfully called SwitchToWeapon({index})");
+                                    LogDebug($"[BetterFire][DashBuffer] Successfully called SwitchToWeapon({index})");
                                     return;
                                 }
                                 catch { }
@@ -1599,14 +1727,14 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             var slotIndex = GetSlotIndexFromKey(key);
             if (slotIndex < 0)
             {
-                Debug.Log($"[BetterFire][DashBuffer] Key {key} is not a recognized weapon hotkey.");
+                LogDebug($"[BetterFire][DashBuffer] Key {key} is not a recognized weapon hotkey.");
                 return;
             }
 
             // 只处理主武器槽位 0-1
             if (slotIndex >= 0 && slotIndex <= 1)
             {
-                Debug.Log($"[BetterFire][DashBuffer] Attempting to switch to weapon index {slotIndex} (weapon {slotIndex + 1})...");
+                LogDebug($"[BetterFire][DashBuffer] Attempting to switch to weapon index {slotIndex} (weapon {slotIndex + 1})...");
                 
                 // 使用 SwitchToWeapon 方法（按索引切换），而不是 SwitchWeapon（按方向切换）
                 var switchToWeaponMethod = characterType.GetMethod("SwitchToWeapon", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
@@ -1616,7 +1744,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     if (parameters.Length == 1 && parameters[0].ParameterType == typeof(int))
                     {
                         switchToWeaponMethod.Invoke(character, new object[] { slotIndex });
-                        Debug.Log($"[BetterFire][DashBuffer] Successfully called SwitchToWeapon({slotIndex})");
+                        LogDebug($"[BetterFire][DashBuffer] Successfully called SwitchToWeapon({slotIndex})");
                         return;
                     }
                 }
@@ -1645,6 +1773,359 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         };
     }
 
+    private bool WasWeaponShortcutTriggered(WeaponShortcutBinding binding, out string label)
+    {
+        label = binding.ActionName;
+
+        var action = GetInputAction(binding.ActionName);
+        if (action != null && action.WasPressedThisFrame())
+        {
+            return true;
+        }
+
+        foreach (var key in binding.Keys)
+        {
+            if (IsKeyDownInputSystem(key))
+            {
+                label = key.ToString();
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private InputAction? GetInputAction(string actionName)
+    {
+        if (string.IsNullOrWhiteSpace(actionName))
+        {
+            return null;
+        }
+
+        if (_inputActionCache.TryGetValue(actionName, out var cached))
+        {
+            return cached;
+        }
+
+        if (_inputActionRetryTimes.TryGetValue(actionName, out var retryAt))
+        {
+            if (Time.unscaledTime < retryAt)
+            {
+                return null;
+            }
+
+            _inputActionRetryTimes.Remove(actionName);
+        }
+
+        var resolved = ResolveInputAction(actionName);
+        if (resolved != null)
+        {
+            _inputActionCache[actionName] = resolved;
+            _inputActionRetryTimes.Remove(actionName);
+            if (_inputActionResolvedOnce.Add(actionName))
+            {
+                LogPerfMarker($"InputAction '{actionName}' 解析成功并缓存。");
+            }
+        }
+        else
+        {
+            ScheduleInputActionRetry(actionName);
+        }
+
+        return resolved;
+    }
+
+    private InputAction? ResolveInputAction(string actionName)
+    {
+        if (!EnsureInputActionResolver())
+        {
+            if (!_loggedInputResolverFailure)
+            {
+                Debug.LogWarning("[BetterFire][Input] CharacterInputControl not found; falling back to device state.");
+                _loggedInputResolverFailure = true;
+            }
+
+            return null;
+        }
+
+        try
+        {
+            if (_getInputActionMethod == null)
+            {
+                return null;
+            }
+
+            if (_inputActionResolutionLogged.Add(actionName))
+            {
+                LogPerfMarker($"尝试通过 CharacterInputControl 解析 InputAction '{actionName}'。");
+            }
+
+            var action = _getInputActionMethod.Invoke(null, new object[] { actionName }) as InputAction;
+            if (action == null && _loggedMissingInputActions.Add(actionName))
+            {
+                Debug.LogWarning($"[BetterFire][Input] InputAction '{actionName}' not found; using device fallback.");
+            }
+
+            return action;
+        }
+        catch (Exception ex)
+        {
+            if (_loggedMissingInputActions.Add(actionName))
+            {
+                Debug.LogWarning($"[BetterFire][Input] Failed to resolve InputAction '{actionName}': {ex.Message}");
+            }
+
+            return null;
+        }
+    }
+
+    private void ScheduleInputActionRetry(string actionName)
+    {
+        var retryAt = Time.unscaledTime + InputActionRetryInterval;
+        _inputActionRetryTimes[actionName] = retryAt;
+        LogPerfMarker($"InputAction '{actionName}' 未找到，将在 {InputActionRetryInterval:F1}s 后重试。");
+    }
+
+    private bool EnsureInputActionResolver()
+    {
+        if (_getInputActionMethod != null)
+        {
+            return true;
+        }
+
+        if (!_characterInputControlLookupAttempted)
+        {
+            LogPerfMarker("开始扫描 CharacterInputControl 类型。");
+            _characterInputControlType = FindCharacterInputControlType();
+            _characterInputControlLookupAttempted = true;
+            if (_characterInputControlType == null)
+            {
+                LogPerfMarker("未找到 CharacterInputControl 类型，推测仍在主菜单。");
+            }
+            else
+            {
+                LogPerfMarker($"已找到 CharacterInputControl：{_characterInputControlType.FullName}。");
+            }
+        }
+
+        if (_characterInputControlType == null)
+        {
+            return false;
+        }
+
+        if (!_inputActionMethodLookupAttempted)
+        {
+            LogPerfMarker("解析 CharacterInputControl.GetInputAction 方法。");
+            _getInputActionMethod = _characterInputControlType.GetMethod("GetInputAction", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            _inputActionMethodLookupAttempted = true;
+
+            if (_getInputActionMethod == null && !_loggedInputResolverFailure)
+            {
+                Debug.LogWarning("[BetterFire][Input] CharacterInputControl.GetInputAction unavailable; device fallback only.");
+                _loggedInputResolverFailure = true;
+            }
+        }
+
+        return _getInputActionMethod != null;
+    }
+
+    private static Type? FindCharacterInputControlType()
+    {
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                var type = assembly.GetType("CharacterInputControl") ??
+                           assembly.GetType("TeamSoda.Duckov.Core.CharacterInputControl");
+                if (type != null)
+                {
+                    return type;
+                }
+
+                type = assembly.GetTypes().FirstOrDefault(t => t.Name == "CharacterInputControl");
+                if (type != null)
+                {
+                    return type;
+                }
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                foreach (var candidate in ex.Types)
+                {
+                    if (candidate != null && candidate.Name == "CharacterInputControl")
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsKeyDownInputSystem(KeyCode keyCode) =>
+        GetButtonControl(keyCode)?.wasPressedThisFrame ?? false;
+
+    private static bool IsKeyHeldInputSystem(KeyCode keyCode) =>
+        GetButtonControl(keyCode)?.isPressed ?? false;
+
+    private static ButtonControl? GetButtonControl(KeyCode keyCode)
+    {
+        if (keyCode == KeyCode.None)
+        {
+            return null;
+        }
+
+        var mouse = Mouse.current;
+        switch (keyCode)
+        {
+            case KeyCode.Mouse0:
+                return mouse?.leftButton;
+            case KeyCode.Mouse1:
+                return mouse?.rightButton;
+            case KeyCode.Mouse2:
+                return mouse?.middleButton;
+            case KeyCode.Mouse3:
+                return mouse?.backButton;
+            case KeyCode.Mouse4:
+                return mouse?.forwardButton;
+        }
+
+        var keyboard = Keyboard.current;
+        if (keyboard != null)
+        {
+            switch (keyCode)
+            {
+                case KeyCode.LeftShift:
+                    return keyboard.leftShiftKey;
+                case KeyCode.RightShift:
+                    return keyboard.rightShiftKey;
+                case KeyCode.LeftControl:
+                    return keyboard.leftCtrlKey;
+                case KeyCode.RightControl:
+                    return keyboard.rightCtrlKey;
+                case KeyCode.LeftAlt:
+                    return keyboard.leftAltKey;
+                case KeyCode.RightAlt:
+                    return keyboard.rightAltKey;
+                case KeyCode.Space:
+                    return keyboard.spaceKey;
+                case KeyCode.Return:
+                    return keyboard.enterKey;
+                case KeyCode.BackQuote:
+                    return keyboard.backquoteKey;
+            }
+
+            if (TryConvertKeyCode(keyCode, out var key))
+            {
+                return keyboard.allKeys.FirstOrDefault(k => k.keyCode == key);
+            }
+        }
+
+        var gamepad = Gamepad.current;
+        if (gamepad != null)
+        {
+            switch (keyCode)
+            {
+                case KeyCode.JoystickButton0:
+                    return gamepad.buttonSouth;
+                case KeyCode.JoystickButton1:
+                    return gamepad.buttonEast;
+                case KeyCode.JoystickButton2:
+                    return gamepad.buttonWest;
+                case KeyCode.JoystickButton3:
+                    return gamepad.buttonNorth;
+                case KeyCode.JoystickButton4:
+                    return gamepad.leftShoulder;
+                case KeyCode.JoystickButton5:
+                    return gamepad.rightShoulder;
+                case KeyCode.JoystickButton8:
+                    return gamepad.startButton;
+                case KeyCode.JoystickButton9:
+                    return gamepad.selectButton;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryConvertKeyCode(KeyCode keyCode, out Key key)
+    {
+        key = default;
+
+        switch (keyCode)
+        {
+            case KeyCode.Alpha0:
+                key = Key.Digit0;
+                return true;
+            case KeyCode.Alpha1:
+                key = Key.Digit1;
+                return true;
+            case KeyCode.Alpha2:
+                key = Key.Digit2;
+                return true;
+            case KeyCode.Alpha3:
+                key = Key.Digit3;
+                return true;
+            case KeyCode.Alpha4:
+                key = Key.Digit4;
+                return true;
+            case KeyCode.Alpha5:
+                key = Key.Digit5;
+                return true;
+            case KeyCode.Alpha6:
+                key = Key.Digit6;
+                return true;
+            case KeyCode.Alpha7:
+                key = Key.Digit7;
+                return true;
+            case KeyCode.Alpha8:
+                key = Key.Digit8;
+                return true;
+            case KeyCode.Alpha9:
+                key = Key.Digit9;
+                return true;
+            case KeyCode.Keypad0:
+                key = Key.Numpad0;
+                return true;
+            case KeyCode.Keypad1:
+                key = Key.Numpad1;
+                return true;
+            case KeyCode.Keypad2:
+                key = Key.Numpad2;
+                return true;
+            case KeyCode.Keypad3:
+                key = Key.Numpad3;
+                return true;
+            case KeyCode.Keypad4:
+                key = Key.Numpad4;
+                return true;
+            case KeyCode.Keypad5:
+                key = Key.Numpad5;
+                return true;
+            case KeyCode.Keypad6:
+                key = Key.Numpad6;
+                return true;
+            case KeyCode.Keypad7:
+                key = Key.Numpad7;
+                return true;
+            case KeyCode.Keypad8:
+                key = Key.Numpad8;
+                return true;
+            case KeyCode.Keypad9:
+                key = Key.Numpad9;
+                return true;
+            case KeyCode.KeypadPeriod:
+                key = Key.NumpadPeriod;
+                return true;
+            case KeyCode.KeypadEnter:
+                key = Key.NumpadEnter;
+                return true;
+        }
+
+        return Enum.TryParse(keyCode.ToString(), true, out key);
+    }
+
     private bool TryProcessPendingSemiAutoShot(CharacterMainControl character, InputManager inputManager)
     {
         if (!_pendingSemiAutoShot)
@@ -1668,204 +2149,183 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         return true;
     }
 
-    private void LoadConfiguration()
+    private void ApplySettings(BetterFireSettings.Data data)
     {
-        _interruptReload = true;
-        _interruptUseItem = true;
-        _interruptInteract = true;
-        _resumeReloadEnabled = true;
-        _autoReloadOnEmpty = true;
-        _dashInputBufferEnabled = true;
-        _autoSwitchFromUnarmed = true;
-        var rawSkipKeys = string.Empty;
-
-        try
-        {
-            if (File.Exists(ConfigFilePath))
-            {
-                foreach (var line in File.ReadAllLines(ConfigFilePath))
-                {
-                    var trimmed = line.Trim();
-                    if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith("#"))
-                    {
-                        continue;
-                    }
-
-                    var separatorIndex = trimmed.IndexOf('=');
-                    if (separatorIndex < 0)
-                    {
-                        continue;
-                    }
-
-                    var key = trimmed[..separatorIndex].Trim().ToLowerInvariant();
-                    var value = trimmed[(separatorIndex + 1)..].Trim();
-
-                    switch (key)
-                    {
-                        case "skipkeys":
-                            rawSkipKeys = value;
-                            break;
-                        case "interrupt_reload":
-                            _interruptReload = ParseBool(value, true);
-                            break;
-                        case "interrupt_useitem":
-                            _interruptUseItem = ParseBool(value, true);
-                            break;
-                        case "interrupt_interact":
-                            _interruptInteract = ParseBool(value, true);
-                            break;
-                        case "resume_reload":
-                            _resumeReloadEnabled = ParseBool(value, true);
-                            break;
-                        case "auto_reload_onempty":
-                            _autoReloadOnEmpty = ParseBool(value, true);
-                            break;
-                        case "dash_input_buffer":
-                            _dashInputBufferEnabled = ParseBool(value, true);
-                            break;
-                        case "auto_switch_from_unarmed":
-                            _autoSwitchFromUnarmed = ParseBool(value, true);
-                            break;
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Debug.LogWarning($"[BetterFire] Failed to read config: {ex.Message}");
-        }
-
-        ApplySkipKeys(rawSkipKeys);
-        SaveConfiguration();
+        _interruptReload = data.InterruptReload;
+        _interruptUseItem = data.InterruptUseItem;
+        _interruptInteract = data.InterruptInteract;
+        _resumeReloadEnabled = data.ResumeReloadAfterDash;
+        _autoReloadOnEmpty = data.AutoReloadOnEmpty;
+        _dashInputBufferEnabled = data.DashInputBuffer;
+        _autoSwitchFromUnarmed = data.AutoSwitchFromUnarmed;
+        _debugLogsEnabled = data.DebugLogs;
     }
 
-    private void ApplySkipKeys(string raw)
+    private void LogDebug(string message)
     {
-        _skipKeysRaw = raw ?? string.Empty;
-        _skipKeys.Clear();
+        if (_debugLogsEnabled)
+        {
+            Debug.Log(message);
+        }
+    }
 
-        if (string.IsNullOrWhiteSpace(_skipKeysRaw))
+    private static readonly float LifecycleLogInterval =  2f;
+
+    private void LogLifecycle(ref float lastLogTime, string message)
+    {
+        var now = Time.unscaledTime;
+        if (now - lastLogTime >= LifecycleLogInterval)
+        {
+            LogDebug(message);
+            lastLogTime = now;
+        }
+    }
+
+    private void UpdateGameplayState(bool active, string reason)
+    {
+        if (active)
+        {
+            if (_gameplayActive)
+            {
+                return;
+            }
+
+            _gameplayActive = true;
+            _lastGameplayBlocker = null;
+            LogPerfMarker("Gameplay systems enabled (entering raid).");
+        }
+        else
+        {
+            if (!_gameplayActive && _lastGameplayBlocker == reason)
+            {
+                return;
+            }
+
+            _gameplayActive = false;
+            _lastGameplayBlocker = reason;
+            LogPerfMarker($"Gameplay systems disabled: {reason}");
+        }
+    }
+
+    private void LogPerfMarker(string message)
+    {
+        if (_debugLogsEnabled)
+        {
+            Debug.Log($"[BetterFire][Perf] {message}");
+        }
+    }
+
+    private void LogPerfMarkerThrottled(string key, string message, float intervalSeconds = 0.5f)
+    {
+        if (!_debugLogsEnabled)
         {
             return;
         }
 
-        var separators = new[] { ',', ';', ' ' };
-        var tokens = _skipKeysRaw.Split(separators, StringSplitOptions.RemoveEmptyEntries);
-        foreach (var token in tokens)
+        var now = Time.unscaledTime;
+        if (_perfMarkerThrottle.TryGetValue(key, out var last) && now - last < intervalSeconds)
         {
-            var trimmed = token.Trim();
-            if (string.IsNullOrEmpty(trimmed))
-            {
-                continue;
-            }
-
-            if (Enum.TryParse(trimmed, true, out KeyCode keyCode))
-            {
-                _skipKeys.Add(keyCode);
-            }
-            else
-            {
-                Debug.LogWarning($"[BetterFire] Unknown key name '{trimmed}' in SkipKeys configuration.");
-            }
+            return;
         }
+
+        _perfMarkerThrottle[key] = now;
+        Debug.Log($"[BetterFire][Perf] {message}");
     }
 
-    private static bool ParseBool(string value, bool defaultValue)
+    private void EnsureActivationMonitor()
     {
-        if (bool.TryParse(value, out var result))
+        if (_activationMonitor != null)
         {
-            return result;
+            return;
         }
 
-        if (int.TryParse(value, out var intValue))
+        var existing = GameObject.Find("BetterFire_GameplayMonitor")?.GetComponent<GameplayActivationMonitor>();
+        if (existing != null)
         {
-            return intValue != 0;
+            _activationMonitor = existing;
+            _activationMonitor.Initialize(this);
+            return;
         }
 
-        return defaultValue;
+        var go = new GameObject("BetterFire_GameplayMonitor");
+        UnityEngine.Object.DontDestroyOnLoad(go);
+        _activationMonitor = go.AddComponent<GameplayActivationMonitor>();
+        _activationMonitor.Initialize(this);
     }
 
-    private void SaveConfiguration()
+    private bool ShouldEnableGameplayLoop()
     {
         try
         {
-            var lines = new[]
+            var levelManager = LevelManager.Instance;
+            if (levelManager == null)
             {
-                "# =====================================",
-                "# BetterFire Configuration / 配置文件",
-                "# =====================================",
-                "",
-                "# 忽略键（SkipKeys）：",
-                "# 使用 Unity KeyCode 名称，多个键用逗号分隔",
-                "# 请查看下方键位对照表  Please check keycode list below",
-                "",
-                $"SkipKeys={_skipKeysRaw}",
-                "",
-                "# 打断逻辑（Interrupt toggles, true/false）",
-                $"Interrupt_Reload={_interruptReload}    # 开火时打断换弹 (Interrupt reload on fire)",
-                $"Interrupt_UseItem={_interruptUseItem}  # 开火时打断使用物品 (Interrupt use item on fire)",
-                $"Interrupt_Interact={_interruptInteract}  # 翻滚时打断交互 (Interrupt interaction on dash)",
-                "",
-                "# 衔接逻辑（Reload/Action continuity, true/false）",
-                $"Resume_Reload={_resumeReloadEnabled}  # Dash后恢复换弹进度 (Resume reload after dash)",
-                $"Auto_Reload_OnEmpty={_autoReloadOnEmpty}  # 空仓自动换弹 (Auto reload when magazine is empty while firing)",
-                "",
-                "# 输入优化（Input optimization, true/false）",
-                $"Dash_Input_Buffer={_dashInputBufferEnabled}  # 翻滚切枪缓冲 (Buffer weapon switch during dash: Keys 1,2,V)",
-                $"Auto_Switch_From_Unarmed={_autoSwitchFromUnarmed}  # 空手开火自动切回上次武器 (Auto switch to last weapon when firing while unarmed)",
-                "",
-                "# =====================================",
-                "# KeyCode List 常用键位对照表",
-                "# =====================================",
-                "",
-                "# 字母键 (Alphabet Keys): A-Z -> A ... Z",
-                "# 数字键 (Number Keys): 主键盘0-9 -> Alpha0 ... Alpha9",
-                "#        小键盘0-9 -> Keypad0 ... Keypad9",
-                "# 功能键 (Function Keys): F1-F12 -> F1 ... F12",
-                "",
-                "# 符号键 (Symbol Keys):",
-                "# BackQuote(`), Minus(-), Equals(=)",
-                "# LeftBracket([), RightBracket(]), Backslash(\\)",
-                "# Semicolon(;), Quote('), Comma(,), Period(.), Slash(/)",
-                "",
-                "# 控制键 (Control Keys):",
-                "# Space(空格), Tab, Escape(ESC), Return(Enter), Backspace",
-                "# Insert, Delete, Home, End, PageUp, PageDown",
-                "",
-                "# 修饰键 (Modifier Keys):",
-                "# LeftShift, RightShift",
-                "# LeftControl, RightControl",
-                "# LeftAlt, RightAlt",
-                "# CapsLock, Numlock, ScrollLock",
-                "",
-                "# 方向键 (Direction Keys): UpArrow, DownArrow, LeftArrow, RightArrow",
-                "",
-                "# 鼠标键 (Mouse Keys):",
-                "# Mouse0 = 左键 (Left Mouse Button)",
-                "# Mouse1 = 右键 (Right Mouse Button)",
-                "# Mouse2 = 中键 (Middle Mouse Button)",
-                "# Mouse3 = 第四键 (侧键)",
-                "# Mouse4 = 第五键 (侧键 (Side Button)",
-                "# Mouse5, Mouse6 = 其他扩展键 (Other Extended Keys)"
-            };
-
-
-            var directory = Path.GetDirectoryName(ConfigFilePath);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-            {
-                Directory.CreateDirectory(directory);
+                return false;
             }
 
-            File.WriteAllLines(ConfigFilePath, lines);
+            if (!LevelManager.LevelInited)
+            {
+                return false;
+            }
+
+            var main = CharacterMainControl.Main ?? levelManager.MainCharacter;
+            if (main == null)
+            {
+                return false;
+            }
+
+            var sceneName = main.gameObject.scene.name ?? string.Empty;
+            if (sceneName.Contains("Menu", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
         }
         catch (Exception ex)
         {
-            Debug.LogWarning($"[BetterFire] Failed to save config: {ex.Message}");
+            LogPerfMarkerThrottled("GameplayGuardError", $"Failed to evaluate gameplay state: {ex.Message}", 5f);
+            return false;
         }
+    }
+
+    private void SetGameplayLoopActive(bool active, string reason)
+    {
+        if (active)
+        {
+            if (_gameplayLoopActive)
+            {
+                return;
+            }
+
+            _gameplayLoopActive = true;
+            enabled = true;
+            Debug.Log("[BetterFire][Lifecycle] Gameplay loop enabled.");
+            UpdateGameplayState(true, reason);
+            return;
+        }
+
+        if (!_gameplayLoopActive)
+        {
+            return;
+        }
+
+        _gameplayLoopActive = false;
+        UpdateGameplayState(false, reason);
+        ResetState();
+        enabled = false;
+        Debug.Log("[BetterFire][Lifecycle] Gameplay loop disabled.");
     }
 
     private void OnDestroy()
     {
+        BetterFireSettings.OnSettingsChanged -= ApplySettings;
+        _harmony?.UnpatchAll("BetterFire.Mod");
+        if (_activationMonitor != null)
+        {
+            _activationMonitor.Cleanup();
+            _activationMonitor = null;
+        }
     }
 
     private bool ShouldForceStop(CharacterActionBase action, CharacterMainControl character, bool allowInterruptInteract)
@@ -1876,13 +2336,13 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             {
                 if (!_interruptReload)
                 {
-                    Debug.Log("[BetterFire][AutoReload] ShouldForceStop: interrupt_reload disabled, not stopping reload.");
+                    LogDebug("[BetterFire][AutoReload] ShouldForceStop: interrupt_reload disabled, not stopping reload.");
                     return false;
                 }
 
                 if (_autoReloadActive)
                 {
-                    Debug.Log("[BetterFire][AutoReload] ShouldForceStop: Auto reload active, protecting reload from interruption.");
+                    LogDebug("[BetterFire][AutoReload] ShouldForceStop: Auto reload active, protecting reload from interruption.");
                     return false;
                 }
 
@@ -1896,7 +2356,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                         {
                             if (bulletCountProperty.GetValue(gun) is int value && value <= 0)
                             {
-                                Debug.Log($"[BetterFire][AutoReload] ShouldForceStop: Magazine empty (count={value}), not stopping reload.");
+                                LogDebug($"[BetterFire][AutoReload] ShouldForceStop: Magazine empty (count={value}), not stopping reload.");
                                 return false;
                             }
                         }
@@ -1905,7 +2365,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                             var bulletCountField = gun.GetType().GetField("bulletCount", BindingFlags.NonPublic | BindingFlags.Instance);
                             if (bulletCountField?.GetValue(gun) is int fieldValue && fieldValue <= 0)
                             {
-                                Debug.Log($"[BetterFire][AutoReload] ShouldForceStop: Magazine empty (count={fieldValue}), not stopping reload.");
+                                LogDebug($"[BetterFire][AutoReload] ShouldForceStop: Magazine empty (count={fieldValue}), not stopping reload.");
                                 return false;
                             }
                         }
@@ -1916,20 +2376,19 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     Debug.LogWarning($"[BetterFire] Failed to inspect gun ammo: {ex.Message}");
                 }
 
-                Debug.Log("[BetterFire][AutoReload] ShouldForceStop: Allowing reload interruption.");
+                LogDebug("[BetterFire][AutoReload] ShouldForceStop: Allowing reload interruption.");
                 return true;
             }
             case CA_UseItem:
                 return _interruptUseItem;
             case CA_Interact:
             {
-                // 修复：左键不能中断CA_Interact动作（玩电脑、对话等特殊交互）
-                // 只有翻滚（空格键）才能中断CA_Interact
                 if (!allowInterruptInteract)
                 {
-                    Debug.Log("[BetterFire][DashDebug] ShouldForceStop: Fire button cannot interrupt CA_Interact. Use dash/space to interrupt.");
+                    LogDebug("[BetterFire][DashDebug] ShouldForceStop: Fire button cannot interrupt CA_Interact. Use dash/space to interrupt.");
                     return false;
                 }
+
                 return _interruptInteract;
             }
             default:
@@ -1939,7 +2398,6 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
     private static bool IsPointerOverUi()
     {
-
         if (Cursor.visible)
         {
             return true;
@@ -1958,4 +2416,84 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 #endif
     }
 
+    private sealed class GameplayActivationMonitor : MonoBehaviour
+    {
+        private ModBehaviour? _owner;
+        private Coroutine? _pollRoutine;
+        private readonly WaitForSeconds _pollDelay = new WaitForSeconds(0.5f);
+
+        public void Initialize(ModBehaviour owner)
+        {
+            _owner = owner;
+            DontDestroyOnLoad(gameObject);
+            SceneManager.activeSceneChanged += HandleSceneChanged;
+            EvaluateState("init");
+            if (isActiveAndEnabled)
+            {
+                _pollRoutine = StartCoroutine(PollRoutine());
+            }
+        }
+
+        private void OnEnable()
+        {
+            if (_pollRoutine == null)
+            {
+                _pollRoutine = StartCoroutine(PollRoutine());
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (_pollRoutine != null)
+            {
+                StopCoroutine(_pollRoutine);
+                _pollRoutine = null;
+            }
+        }
+
+        private IEnumerator PollRoutine()
+        {
+            while (true)
+            {
+                EvaluateState("poll");
+                yield return _pollDelay;
+            }
+        }
+
+        private void HandleSceneChanged(Scene previous, Scene next)
+        {
+            EvaluateState($"scene:{next.name}");
+        }
+
+        private void EvaluateState(string reason)
+        {
+            if (_owner == null)
+            {
+                return;
+            }
+
+            var shouldEnable = _owner.ShouldEnableGameplayLoop();
+            _owner.SetGameplayLoopActive(shouldEnable, reason);
+        }
+
+        public void Cleanup()
+        {
+            SceneManager.activeSceneChanged -= HandleSceneChanged;
+            if (_pollRoutine != null)
+            {
+                StopCoroutine(_pollRoutine);
+                _pollRoutine = null;
+            }
+
+            if (gameObject != null)
+            {
+                Destroy(gameObject);
+            }
+        }
+
+        private void OnDestroy()
+        {
+            SceneManager.activeSceneChanged -= HandleSceneChanged;
+        }
+    }
 }

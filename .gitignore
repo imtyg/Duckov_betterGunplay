@@ -1,3 +1,50 @@
+# IDE
+.vs/
+.vscode/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Build outputs
+bin/
+obj/
+[Bb]uild/
+[Ll]ogs/
+*.log
+
+# C# temp/cache
+*.cache
+*.tmp
+
+# NuGet/packages
+packages/
+*.nupkg
+.nuget/
+
+# Test/coverage
+TestResults/
+*.coverage
+*.coveragexml
+
+# Binaries (common in this repo root)
+*.dll
+*.pdb
+*.mdb
+*.so
+*.dylib
+*.a
+*.lib
+*.deps.json
+
+# OS junk
+*.DS_Store
+Thumbs.db
+
+# Unignore examples (keep specific files if needed)
+#!example/keep.me
+
 # 排除编译中间文件和输出文件
 **/obj/
 **/bin/
