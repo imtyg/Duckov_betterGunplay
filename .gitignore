@@ -49,6 +49,9 @@ Thumbs.db
 **/obj/
 **/bin/
 *.dll
+# 但保留这些可运行的 mod DLL 文件
+!0Harmony.dll
+!BetterFire.dll
 *.pdb
 *.exe
 
