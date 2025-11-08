@@ -248,7 +248,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     // Dash Input Buffer
     private bool _dashInputBufferEnabled = true;
     private bool _isDashing;
-    private readonly List<KeyCode> _bufferedKeys = new();
+    private readonly List<BufferedWeaponCommand> _bufferedWeaponCommands = new();
     private Coroutine? _inputBufferCoroutine;
     
     // Auto Switch to Last Weapon when Unarmed
@@ -283,6 +283,14 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
     private readonly Dictionary<Type, CharacterReflectionCache> _characterReflectionCache = new();
     private readonly Dictionary<Type, PropertyInfo?> _slotItemPropertyCache = new();
+<<<<<<< HEAD
+=======
+    private static Type? _scrollWheelBehaviourType;
+    private static PropertyInfo? _scrollWheelBehaviourProperty;
+    private static object? _scrollWheelAmmoAndInteractValue;
+    private static bool _scrollWheelReflectionAttempted;
+    private static bool _scrollWheelReflectionLogged;
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
 
     private static FieldInfo? GetInstanceField(Type type, string name) =>
         type.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy);
@@ -322,6 +330,36 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         public KeyCode CanonicalKey => Keys.Length > 0 ? Keys[0] : KeyCode.None;
     }
 
+<<<<<<< HEAD
+=======
+    private enum BufferedWeaponCommandType
+    {
+        SlotKey,
+        Relative
+    }
+
+    private readonly struct BufferedWeaponCommand
+    {
+        public BufferedWeaponCommand(KeyCode key)
+        {
+            Type = BufferedWeaponCommandType.SlotKey;
+            Key = key;
+            Direction = 0;
+        }
+
+        public BufferedWeaponCommand(int direction)
+        {
+            Type = BufferedWeaponCommandType.Relative;
+            Direction = direction;
+            Key = KeyCode.None;
+        }
+
+        public BufferedWeaponCommandType Type { get; }
+        public KeyCode Key { get; }
+        public int Direction { get; }
+    }
+
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
     private sealed class CharacterReflectionCache
     {
         public MethodInfo? SwitchToWeapon;
@@ -1010,7 +1048,24 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         if (value is UnityEngine.Object unityObject)
         {
-            return $"{unityObject.GetType().Name}({unityObject.name})";
+            try
+            {
+                if (unityObject == null)
+                {
+                    return $"{value.GetType().Name}(destroyed)";
+                }
+
+                var objectName = string.IsNullOrEmpty(unityObject.name) ? "Unnamed" : unityObject.name;
+                return $"{unityObject.GetType().Name}({objectName})";
+            }
+            catch (MissingReferenceException)
+            {
+                return $"{value.GetType().Name}(destroyed)";
+            }
+            catch (Exception ex)
+            {
+                return $"{value.GetType().Name}(error:{ex.Message})";
+            }
         }
 
         return value.GetType().Name;
@@ -1056,7 +1111,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         
         // Dash Input Buffer
         _isDashing = false;
-        _bufferedKeys.Clear();
+        _bufferedWeaponCommands.Clear();
         if (_inputBufferCoroutine != null)
         {
             StopCoroutine(_inputBufferCoroutine);
@@ -1543,9 +1598,165 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             if (WasWeaponShortcutTriggered(binding, out var label))
             {
                 BufferWeaponKey(binding.CanonicalKey, label);
+<<<<<<< HEAD
                 break; // 每帧只处理一个按键
+=======
+                return; // 每帧只处理一个按键
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
             }
         }
+
+        if (TryBufferSwitchWeaponAction())
+        {
+            return;
+        }
+
+        TryBufferScrollWheelWeapon();
+    }
+
+    private void BufferWeaponKey(KeyCode key, string label)
+    {
+        if (key == KeyCode.None)
+        {
+            return;
+        }
+
+        if (_bufferedWeaponCommands.Count > 0)
+        {
+            _bufferedWeaponCommands.Clear();
+        }
+
+        _bufferedWeaponCommands.Add(new BufferedWeaponCommand(key));
+        LogDebug($"[BetterFire][DashBuffer] Input buffered during dash: {label} ({key})");
+    }
+
+    private void BufferWeaponDirection(int direction, string label)
+    {
+        if (direction == 0)
+        {
+            return;
+        }
+
+        if (_bufferedWeaponCommands.Count > 0)
+        {
+            _bufferedWeaponCommands.Clear();
+        }
+
+        _bufferedWeaponCommands.Add(new BufferedWeaponCommand(direction));
+        LogDebug($"[BetterFire][DashBuffer] Input buffered during dash: {label} (dir={direction})");
+    }
+
+    private bool TryBufferSwitchWeaponAction()
+    {
+        var action = GetInputAction("SwitchWeapon");
+        if (action == null || !action.triggered)
+        {
+            return false;
+        }
+
+        var value = action.ReadValue<float>();
+        if (Mathf.Abs(value) < 0.1f)
+        {
+            return false;
+        }
+
+        var direction = value > 0f ? -1 : 1;
+        var label = direction > 0 ? "SwitchWeaponNext" : "SwitchWeaponPrevious";
+        BufferWeaponDirection(direction, label);
+        return true;
+    }
+
+    private bool TryBufferScrollWheelWeapon()
+    {
+        if (!IsScrollWheelInWeaponMode())
+        {
+            return false;
+        }
+
+        var action = GetInputAction("ScrollWheel");
+        if (action == null || !action.triggered)
+        {
+            return false;
+        }
+
+        var delta = action.ReadValue<Vector2>().y;
+        if (Mathf.Abs(delta) < 0.1f)
+        {
+            return false;
+        }
+
+        var direction = delta > 0f ? 1 : -1;
+        var label = direction > 0 ? "ScrollWheelUp" : "ScrollWheelDown";
+        BufferWeaponDirection(direction, label);
+        return true;
+    }
+
+    private bool IsScrollWheelInWeaponMode()
+    {
+        try
+        {
+            EnsureScrollWheelBehaviourMetadata();
+
+            if (_scrollWheelBehaviourProperty == null || _scrollWheelAmmoAndInteractValue == null)
+            {
+                // 如果无法获取到元数据，默认为武器模式，避免功能失效
+                return true;
+            }
+
+            var current = _scrollWheelBehaviourProperty.GetValue(null);
+            return current == null || !current.Equals(_scrollWheelAmmoAndInteractValue);
+        }
+        catch (Exception ex)
+        {
+            if (!_scrollWheelReflectionLogged)
+            {
+                Debug.LogWarning($"[BetterFire][DashBuffer] Failed to inspect ScrollWheelBehaviour: {ex.Message}");
+                _scrollWheelReflectionLogged = true;
+            }
+
+            return true;
+        }
+    }
+
+    private void EnsureScrollWheelBehaviourMetadata()
+    {
+        if (_scrollWheelReflectionAttempted)
+        {
+            return;
+        }
+
+        _scrollWheelReflectionAttempted = true;
+
+        _scrollWheelBehaviourType = FindScrollWheelBehaviourType();
+        if (_scrollWheelBehaviourType == null)
+        {
+            return;
+        }
+
+        _scrollWheelBehaviourProperty = _scrollWheelBehaviourType.GetProperty(
+            "CurrentBehaviour",
+            BindingFlags.Public | BindingFlags.Static);
+
+        var behaviourEnum = _scrollWheelBehaviourType.GetNestedType(
+            "Behaviour",
+            BindingFlags.Public | BindingFlags.NonPublic);
+        if (behaviourEnum != null)
+        {
+            try
+            {
+                _scrollWheelAmmoAndInteractValue = Enum.Parse(behaviourEnum, "AmmoAndInteract");
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+    }
+
+    private static Type? FindScrollWheelBehaviourType()
+    {
+        return Type.GetType("ScrollWheelBehaviour") ??
+               Type.GetType("TeamSoda.Duckov.Core.ScrollWheelBehaviour");
     }
 
     private void BufferWeaponKey(KeyCode key, string label)
@@ -1568,16 +1779,20 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     {
         if (!_dashInputBufferEnabled)
         {
-            _bufferedKeys.Clear();
+            _bufferedWeaponCommands.Clear();
             return;
         }
 
-        if (_bufferedKeys.Count == 0)
+        if (_bufferedWeaponCommands.Count == 0)
         {
             return;
         }
 
+<<<<<<< HEAD
         LogDebug($"[BetterFire][DashBuffer] Triggering {_bufferedKeys.Count} buffered inputs...");
+=======
+        LogDebug($"[BetterFire][DashBuffer] Triggering {_bufferedWeaponCommands.Count} buffered inputs...");
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
         
         // 停止之前的协程（如果有）
         if (_inputBufferCoroutine != null)
@@ -1594,20 +1809,49 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         // 等待一小段时间，让Dash动画完全结束
         yield return new WaitForSeconds(0.1f);
 
-        var keysToReplay = new List<KeyCode>(_bufferedKeys);
-        _bufferedKeys.Clear();
+        var commandsToReplay = new List<BufferedWeaponCommand>(_bufferedWeaponCommands);
+        _bufferedWeaponCommands.Clear();
 
-        foreach (var key in keysToReplay)
+        foreach (var command in commandsToReplay)
         {
+<<<<<<< HEAD
             LogDebug($"[BetterFire][DashBuffer] Replaying key: {key}");
             
             // 等待玩家松开该键（如果还在按着）
             var timeout = 0f;
             while (IsKeyHeldInputSystem(key) && timeout < 0.5f)
+=======
+            switch (command.Type)
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
             {
-                timeout += Time.deltaTime;
-                yield return null;
+                case BufferedWeaponCommandType.SlotKey:
+                {
+                    var key = command.Key;
+                    LogDebug($"[BetterFire][DashBuffer] Replaying key: {key}");
+                    
+                    // 等待玩家松开该键（如果还在按着）
+                    var timeout = 0f;
+                    while (IsKeyHeldInputSystem(key) && timeout < 0.5f)
+                    {
+                        timeout += Time.deltaTime;
+                        yield return null;
+                    }
+
+                    // 再等待一小段时间，确保游戏系统准备好接收输入
+                    yield return new WaitForSeconds(0.05f);
+                    LogDebug($"[BetterFire][DashBuffer] Key {key} ready to be processed. Checking if player is still pressing...");
+                    TryTriggerWeaponSwitch(key);
+                    break;
+                }
+                case BufferedWeaponCommandType.Relative:
+                {
+                    // 方向切换不依赖具体按键，直接触发
+                    yield return new WaitForSeconds(0.05f);
+                    TryTriggerRelativeWeaponSwitch(command.Direction);
+                    break;
+                }
             }
+<<<<<<< HEAD
 
             // 再等待一小段时间，确保游戏系统准备好接收输入
             yield return new WaitForSeconds(0.05f);
@@ -1622,6 +1866,8 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             // 这里我们无法直接模拟按键，但可以通过其他方式实现
             // 比如调用CharacterMainControl的武器切换方法（需要反射）
             TryTriggerWeaponSwitch(key);
+=======
+>>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
         }
 
         _inputBufferCoroutine = null;
@@ -1759,6 +2005,30 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         catch (Exception ex)
         {
             Debug.LogWarning($"[BetterFire][DashBuffer] Error triggering weapon/item switch: {ex.Message}");
+        }
+    }
+
+    private void TryTriggerRelativeWeaponSwitch(int direction)
+    {
+        if (direction == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var inputManager = LevelManager.Instance?.InputManager;
+            if (inputManager == null)
+            {
+                return;
+            }
+
+            inputManager.SetSwitchWeaponInput(direction);
+            LogDebug($"[BetterFire][DashBuffer] Triggered relative weapon switch (dir={direction}).");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[BetterFire][DashBuffer] Failed to trigger relative weapon switch: {ex.Message}");
         }
     }
 
