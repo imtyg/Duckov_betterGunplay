@@ -244,6 +244,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
     private int _lastBulletCount = -1;
     private bool _autoReloadActive;
     private Coroutine? _autoReloadCoroutine;
+    private Coroutine? _ensureSemiAutoShotCoroutine;
     
     // Dash Input Buffer
     private bool _dashInputBufferEnabled = true;
@@ -283,14 +284,11 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
     private readonly Dictionary<Type, CharacterReflectionCache> _characterReflectionCache = new();
     private readonly Dictionary<Type, PropertyInfo?> _slotItemPropertyCache = new();
-<<<<<<< HEAD
-=======
     private static Type? _scrollWheelBehaviourType;
     private static PropertyInfo? _scrollWheelBehaviourProperty;
     private static object? _scrollWheelAmmoAndInteractValue;
     private static bool _scrollWheelReflectionAttempted;
     private static bool _scrollWheelReflectionLogged;
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
 
     private static FieldInfo? GetInstanceField(Type type, string name) =>
         type.GetField(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy);
@@ -330,8 +328,6 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         public KeyCode CanonicalKey => Keys.Length > 0 ? Keys[0] : KeyCode.None;
     }
 
-<<<<<<< HEAD
-=======
     private enum BufferedWeaponCommandType
     {
         SlotKey,
@@ -359,7 +355,6 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         public int Direction { get; }
     }
 
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
     private sealed class CharacterReflectionCache
     {
         public MethodInfo? SwitchToWeapon;
@@ -747,7 +742,18 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         }
 
         var gunSetting = gun.GunItemSetting;
-        if (gunSetting == null || GunTriggerModeField == null)
+        if (gunSetting == null)
+        {
+            // 关卡初始化时 GunItemSetting 可能还未加载，延迟重试
+            if (_ensureSemiAutoShotCoroutine == null)
+            {
+                LogDebug("[BetterFire][DashDebug] GunItemSetting is null, scheduling retry for semi-auto shot detection.");
+                _ensureSemiAutoShotCoroutine = StartCoroutine(EnsureSemiAutoShotRetryCoroutine(character, inputManager));
+            }
+            return;
+        }
+
+        if (GunTriggerModeField == null)
         {
             return;
         }
@@ -758,7 +764,47 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             (triggerMode == ItemSetting_Gun.TriggerModes.semi || triggerMode == ItemSetting_Gun.TriggerModes.bolt))
         {
             _pendingSemiAutoShot = true;
+            LogDebug("[BetterFire][DashDebug] Semi-auto weapon detected, pending shot enabled.");
         }
+    }
+
+    private IEnumerator EnsureSemiAutoShotRetryCoroutine(CharacterMainControl character, InputManager inputManager)
+    {
+        // 等待几帧，让 GunItemSetting 有时间初始化
+        yield return null;
+        yield return null;
+        yield return null;
+
+        var gun = character.GetGun();
+        if (gun == null)
+        {
+            _ensureSemiAutoShotCoroutine = null;
+            yield break;
+        }
+
+        var gunSetting = gun.GunItemSetting;
+        if (gunSetting == null)
+        {
+            LogDebug("[BetterFire][DashDebug] GunItemSetting still null after retry, giving up.");
+            _ensureSemiAutoShotCoroutine = null;
+            yield break;
+        }
+
+        if (GunTriggerModeField == null)
+        {
+            _ensureSemiAutoShotCoroutine = null;
+            yield break;
+        }
+
+        // 通过反射字段获取triggerMode
+        if (GunTriggerModeField.GetValue(gunSetting) is ItemSetting_Gun.TriggerModes triggerMode &&
+            (triggerMode == ItemSetting_Gun.TriggerModes.semi || triggerMode == ItemSetting_Gun.TriggerModes.bolt))
+        {
+            _pendingSemiAutoShot = true;
+            LogDebug("[BetterFire][DashDebug] Semi-auto weapon detected after retry, pending shot enabled.");
+        }
+
+        _ensureSemiAutoShotCoroutine = null;
     }
 
     private static void ApplySprint(CharacterMainControl character, InputManager inputManager, bool run)
@@ -1109,6 +1155,12 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             _autoReloadCoroutine = null;
         }
         
+        if (_ensureSemiAutoShotCoroutine != null)
+        {
+            StopCoroutine(_ensureSemiAutoShotCoroutine);
+            _ensureSemiAutoShotCoroutine = null;
+        }
+        
         // Dash Input Buffer
         _isDashing = false;
         _bufferedWeaponCommands.Clear();
@@ -1121,6 +1173,32 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         // Auto Switch to Last Weapon
         _wasArmedLastFrame = false;
         // 注意：不重置 _lastWeaponIndex，因为我们希望它在整个会话中保持
+    }
+
+    private void ClearCaches()
+    {
+        // 清理可能失效的缓存，允许在重新进入游戏世界时重新查找
+        _inputActionCache.Clear();
+        _inputActionRetryTimes.Clear();
+        _inputActionResolutionLogged.Clear();
+        _inputActionResolvedOnce.Clear();
+        _loggedMissingInputActions.Clear();
+        _characterReflectionCache.Clear();
+        _slotItemPropertyCache.Clear();
+        
+        // 重置反射查找标志，允许重新查找（场景切换后类型可能重新加载）
+        _characterInputControlLookupAttempted = false;
+        _inputActionMethodLookupAttempted = false;
+        _characterInputControlType = null;
+        _getInputActionMethod = null;
+        _loggedInputResolverFailure = false;
+        
+        // 重置滚动轮相关反射
+        _scrollWheelReflectionAttempted = false;
+        _scrollWheelReflectionLogged = false;
+        _scrollWheelBehaviourType = null;
+        _scrollWheelBehaviourProperty = null;
+        _scrollWheelAmmoAndInteractValue = null;
     }
 
     private bool TryCancelInteraction(CharacterMainControl character, bool allowInterruptInteract)
@@ -1598,11 +1676,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             if (WasWeaponShortcutTriggered(binding, out var label))
             {
                 BufferWeaponKey(binding.CanonicalKey, label);
-<<<<<<< HEAD
-                break; // 每帧只处理一个按键
-=======
                 return; // 每帧只处理一个按键
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
             }
         }
 
@@ -1759,22 +1833,6 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                Type.GetType("TeamSoda.Duckov.Core.ScrollWheelBehaviour");
     }
 
-    private void BufferWeaponKey(KeyCode key, string label)
-    {
-        if (key == KeyCode.None)
-        {
-            return;
-        }
-
-        if (_bufferedKeys.Count > 0)
-        {
-            _bufferedKeys.Clear();
-        }
-
-        _bufferedKeys.Add(key);
-        LogDebug($"[BetterFire][DashBuffer] Input buffered during dash: {label} ({key})");
-    }
-
     private void TriggerBufferedInputs()
     {
         if (!_dashInputBufferEnabled)
@@ -1788,11 +1846,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
             return;
         }
 
-<<<<<<< HEAD
-        LogDebug($"[BetterFire][DashBuffer] Triggering {_bufferedKeys.Count} buffered inputs...");
-=======
         LogDebug($"[BetterFire][DashBuffer] Triggering {_bufferedWeaponCommands.Count} buffered inputs...");
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
         
         // 停止之前的协程（如果有）
         if (_inputBufferCoroutine != null)
@@ -1814,15 +1868,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
 
         foreach (var command in commandsToReplay)
         {
-<<<<<<< HEAD
-            LogDebug($"[BetterFire][DashBuffer] Replaying key: {key}");
-            
-            // 等待玩家松开该键（如果还在按着）
-            var timeout = 0f;
-            while (IsKeyHeldInputSystem(key) && timeout < 0.5f)
-=======
             switch (command.Type)
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
             {
                 case BufferedWeaponCommandType.SlotKey:
                 {
@@ -1851,23 +1897,6 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
                     break;
                 }
             }
-<<<<<<< HEAD
-
-            // 再等待一小段时间，确保游戏系统准备好接收输入
-            yield return new WaitForSeconds(0.05f);
-
-            // 尝试模拟按键输入
-            // 注意：Unity的Input系统不支持直接注入按键事件
-            // 我们需要在这里调用游戏的武器切换方法
-            // 由于没有直接的API，我们记录日志提示玩家可以再按一次
-            LogDebug($"[BetterFire][DashBuffer] Key {key} ready to be processed. Checking if player is still pressing...");
-            
-            // 如果玩家在Dash结束后立即再次按下该键，游戏会自然处理
-            // 这里我们无法直接模拟按键，但可以通过其他方式实现
-            // 比如调用CharacterMainControl的武器切换方法（需要反射）
-            TryTriggerWeaponSwitch(key);
-=======
->>>>>>> 6dc4ffd (feat: update ModBehaviour and add Settings/UI modules)
         }
 
         _inputBufferCoroutine = null;
@@ -2583,6 +2612,7 @@ public class ModBehaviour : Duckov.Modding.ModBehaviour
         _gameplayLoopActive = false;
         UpdateGameplayState(false, reason);
         ResetState();
+        ClearCaches(); // 清理缓存，确保重新进入游戏世界时能正确初始化
         enabled = false;
         Debug.Log("[BetterFire][Lifecycle] Gameplay loop disabled.");
     }
